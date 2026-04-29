@@ -101,6 +101,12 @@ useEffect(() => {
             <p className="text-sm text-gray-500 mt-1">Vytváření směn a přiřazování lidí</p>
           </a>
 
+          <a href="/approve" className="block bg-white rounded-lg border border-gray-200 p-6 hover:border-orange-300 transition-colors">
+            <div className="text-2xl mb-2">✅</div>
+            <h3 className="font-semibold text-gray-900">Schvalování</h3>
+            <p className="text-sm text-gray-500 mt-1">Kontrola a schvalování timesheetů</p>
+          </a>
+
           <a href="/users" className="block bg-white rounded-lg border border-gray-200 p-6 hover:border-orange-300 transition-colors">
             <div className="text-2xl mb-2">👥</div>
             <h3 className="font-semibold text-gray-900">Uživatelé</h3>

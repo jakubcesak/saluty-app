@@ -1,8 +1,9 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { supabase } from '../../lib/supabase'
 
+// ─── Types ───────────────────────────────────────────────────
 type Worker = {
   id: string
   name: string
@@ -21,7 +22,7 @@ type MonthSummary = {
   consumption: number
   penalty: number
   payout: number
-  status: string
+  status: 'draft' | 'submitted' | 'approved'
   timesheetIds: string[]
 }
 
@@ -37,8 +38,106 @@ type TimesheetRow = {
   admin_start: string | null
   admin_end: string | null
   admin_night: number | null
+  rejected_at: string | null
+  rejected_by: string | null
+  added_by_admin: string | null
+  admin_note: string | null
 }
 
+type Adjustments = {
+  tips: string
+  bonus: string
+  consumption: string
+  penalty: string
+}
+
+// ─── Helpers ─────────────────────────────────────────────────
+function monthLabel(d: Date): string {
+  return d.toLocaleDateString('cs-CZ', { month: 'long', year: 'numeric' })
+}
+
+function monthKey(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+function formatDate(s: string): string {
+  const d = new Date(s + 'T00:00:00')
+  return d.toLocaleDateString('cs-CZ', { weekday: 'short', day: 'numeric', month: 'numeric' })
+}
+
+function formatCZK(n: number): string {
+  return n.toLocaleString('cs-CZ', { style: 'currency', currency: 'CZK', minimumFractionDigits: 0, maximumFractionDigits: 0 })
+}
+
+function calcHours(start: string, end: string): number {
+  const [sh, sm] = start.split(':').map(Number)
+  const [eh, em] = end.split(':').map(Number)
+  let mins = (eh * 60 + em) - (sh * 60 + sm)
+  if (mins < 0) mins += 24 * 60 // overnight
+  return Math.round(mins / 60 * 100) / 100
+}
+
+function calcNightHours(start: string, end: string): number {
+  // Night hours: 22:00 - 06:00
+  const [sh, sm] = start.split(':').map(Number)
+  const [eh, em] = end.split(':').map(Number)
+  let startMins = sh * 60 + sm
+  let endMins = eh * 60 + em
+  if (endMins <= startMins) endMins += 24 * 60
+
+  let night = 0
+  for (let m = startMins; m < endMins; m++) {
+    const hour = (m % (24 * 60)) / 60
+    if (hour >= 22 || hour < 6) night++
+  }
+  return Math.round(night / 60 * 100) / 100
+}
+
+// CZ QR payment string (SPD format)
+function generateSPD(account: string, amount: number, message: string): string {
+  // account format: 123456789/0100 -> CZ IBAN or just use as-is
+  const cappedAmount = Math.min(amount, 11400)
+  const parts = [
+    'SPD*1.0',
+    `ACC:${account.replace(/\s/g, '')}`,
+    `AM:${cappedAmount.toFixed(2)}`,
+    'CC:CZK',
+    `MSG:${message.substring(0, 60)}`,
+  ]
+  return parts.join('*')
+}
+
+// ─── QR Code Component ──────────────────────────────────────
+function QrCode({ data, size = 160 }: { data: string; size?: number }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [loaded, setLoaded] = useState(false)
+
+  useEffect(() => {
+    if ((window as any).QRCode) {
+      setLoaded(true)
+      return
+    }
+    const script = document.createElement('script')
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js'
+    script.onload = () => setLoaded(true)
+    document.head.appendChild(script)
+  }, [])
+
+  useEffect(() => {
+    if (!loaded || !ref.current) return
+    ref.current.innerHTML = ''
+    new (window as any).QRCode(ref.current, {
+      text: data,
+      width: size,
+      height: size,
+      correctLevel: (window as any).QRCode.CorrectLevel.M,
+    })
+  }, [loaded, data, size])
+
+  return <div ref={ref} className="inline-block" />
+}
+
+// ─── Main Component ──────────────────────────────────────────
 export default function ApprovePage() {
   const [currentUser, setCurrentUser] = useState<any>(null)
   const [workers, setWorkers] = useState<Worker[]>([])
@@ -46,561 +145,803 @@ export default function ApprovePage() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
+  const [messageType, setMessageType] = useState<'ok' | 'err'>('ok')
+
+  // Detail view
   const [selectedWorker, setSelectedWorker] = useState<string | null>(null)
   const [detailRows, setDetailRows] = useState<TimesheetRow[]>([])
-  const [adjustments, setAdjustments] = useState<Record<string, { bonus: string; consumption: string; penalty: string }>>({})
+  const [adjustments, setAdjustments] = useState<Record<string, Adjustments>>({})
+
+  // Add row form
+  const [showAddRow, setShowAddRow] = useState(false)
+  const [newRow, setNewRow] = useState({ date: '', start: '', end: '', note: '' })
+
+  // Month navigation
   const [monthDate, setMonthDate] = useState(() => {
     const d = new Date()
-    return { year: d.getFullYear(), month: d.getMonth() }
+    return new Date(d.getFullYear(), d.getMonth(), 1)
   })
 
-  const monthStart = new Date(monthDate.year, monthDate.month, 1).toISOString().split('T')[0]
-  const monthEnd = new Date(monthDate.year, monthDate.month + 1, 0).toISOString().split('T')[0]
-  const monthLabel = new Date(monthDate.year, monthDate.month, 1).toLocaleDateString('cs-CZ', { month: 'long', year: 'numeric' })
+  const showMsg = (text: string, type: 'ok' | 'err' = 'ok') => {
+    setMessage(text)
+    setMessageType(type)
+    setTimeout(() => setMessage(''), 4000)
+  }
 
+  // ─── Load current user ────────────────────────────────────
   useEffect(() => {
-    supabase.auth.getUser().then(async ({ data: { user } }) => {
-      if (!user) { window.location.href = '/login'; return }
-      setCurrentUser(user)
-      const { data: w } = await supabase.from('users').select('*').is('deleted_at', null).eq('is_active', true).order('name')
-      if (w) setWorkers(w)
-      setLoading(false)
+    supabase.auth.getUser().then(({ data }) => {
+      if (data?.user) {
+        supabase.from('users').select('*').eq('email', data.user.email).single()
+          .then(({ data: u }) => setCurrentUser(u))
+      }
     })
   }, [])
 
-  useEffect(() => {
-    if (!loading) loadSummaries()
-  }, [monthDate, loading])
+  // ─── Load workers & summaries ─────────────────────────────
+  const loadData = useCallback(async () => {
+    setLoading(true)
+    const mk = monthKey(monthDate)
+    const startDate = `${mk}-01`
+    const endDay = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0).getDate()
+    const endDate = `${mk}-${String(endDay).padStart(2, '0')}`
 
-  const loadSummaries = async () => {
-    const sums: MonthSummary[] = []
+    // Get workers
+    const { data: workerData } = await supabase
+      .from('users')
+      .select('*')
+      .eq('role', 'worker')
+      .order('name')
+    const ws: Worker[] = workerData || []
+    setWorkers(ws)
 
-    for (const worker of workers) {
-      const { data: ts } = await supabase.from('timesheets').select('*')
-        .eq('user_id', worker.id)
-        .gte('work_date', monthStart).lte('work_date', monthEnd)
-        .is('deleted_at', null)
+    // Get timesheets for this month
+    const { data: tsData } = await supabase
+      .from('timesheets')
+      .select('*')
+      .gte('work_date', startDate)
+      .lte('work_date', endDate)
+      .is('deleted_at', null)
+      .order('work_date')
 
-      if (!ts || ts.length === 0) continue
+    // Get monthly reports
+    const { data: reportData } = await supabase
+      .from('monthly_reports')
+      .select('*')
+      .eq('month', mk)
 
-      let totalHours = 0
-      let nightHours = 0
-      ts.forEach(t => {
-        totalHours += t.hours_worked || 0
-        nightHours += t.night_hours || 0
+    const rows = tsData || []
+    const reports = reportData || []
+
+    // Get tips for this month
+    const { data: tipsData } = await supabase
+      .from('daily_tips')
+      .select('*')
+      .gte('shift_date', startDate)
+      .lte('shift_date', endDate)
+
+    // Calculate tip share per worker per month (equal split among workers who worked that day)
+    const tipsByDate: Record<string, number> = {}
+    ;(tipsData || []).forEach((t: any) => {
+      tipsByDate[t.shift_date] = (tipsByDate[t.shift_date] || 0) + Number(t.total_tips || 0)
+    })
+
+    // Build summaries
+    const sums: MonthSummary[] = ws.map(w => {
+      const workerRows = rows.filter((r: any) => r.user_id === w.id)
+      const activeRows = workerRows.filter((r: any) => !r.rejected_at)
+      const report = reports.find((r: any) => r.user_id === w.id)
+
+      // Calculate tip share: for each day the worker worked, split tips equally
+      let tipShare = 0
+      const workedDates = new Set(activeRows.map((r: any) => r.work_date))
+      workedDates.forEach(date => {
+        if (tipsByDate[date]) {
+          const workersOnDay = rows.filter((r: any) => r.work_date === date && !r.rejected_at)
+          const uniqueWorkers = new Set(workersOnDay.map((r: any) => r.user_id))
+          tipShare += tipsByDate[date] / uniqueWorkers.size
+        }
       })
 
-      const regularHours = totalHours - nightHours
-      const wage = (regularHours * worker.hourly_rate) + (nightHours * worker.hourly_rate * 2)
+      const totalHours = activeRows.reduce((s: number, r: any) => {
+        const h = r.admin_start ? calcHours(r.admin_start, r.admin_end || r.actual_end) : r.hours_worked
+        return s + h
+      }, 0)
+      const nightHours = activeRows.reduce((s: number, r: any) => {
+        if (r.admin_night !== null) return s + r.admin_night
+        return s + (r.night_hours || 0)
+      }, 0)
 
-      // Load tips
-      let tips = 0
-      const { data: shiftsInMonth } = await supabase.from('shifts').select('id')
-        .gte('shift_date', monthStart).lte('shift_date', monthEnd).is('deleted_at', null)
+      const wage = Math.round(totalHours * w.hourly_rate)
+      const bonus = report ? Number(report.bonus || 0) : 0
+      const consumption = report ? Number(report.consumption || 0) : 0
+      const penalty = report ? Number(report.penalty || 0) : 0
+      const tips = report && report.tips !== undefined ? Number(report.tips) : Math.round(tipShare)
+      const payout = wage + tips + bonus - consumption - penalty
 
-      if (shiftsInMonth) {
-        const shiftIds = shiftsInMonth.map(s => s.id)
-        if (shiftIds.length > 0) {
-          const { data: tipsData } = await supabase.from('daily_tips').select('*').in('shift_id', shiftIds)
-          if (tipsData) {
-            for (const tip of tipsData) {
-              const { data: slotsForShift } = await supabase.from('shift_slots').select('id').eq('shift_id', tip.shift_id)
-              if (!slotsForShift) continue
-              const slotIds = slotsForShift.map(s => s.id)
-              if (slotIds.length === 0) continue
-              const { data: signupsForShift } = await supabase.from('shift_signups').select('user_id')
-                .in('slot_id', slotIds).eq('status', 'confirmed')
-              if (!signupsForShift) continue
-              const uniqueWorkers = new Set(signupsForShift.map(s => s.user_id))
-              if (uniqueWorkers.has(worker.id)) {
-                tips += Math.round(tip.total_tips / uniqueWorkers.size)
-              }
-            }
-          }
-        }
-      }
+      // Determine status
+      let status: 'draft' | 'submitted' | 'approved' = 'draft'
+      if (report?.status === 'approved') status = 'approved'
+      else if (workerRows.some((r: any) => r.status === 'submitted')) status = 'submitted'
 
-      // Load adjustments from monthly_reports
-      const { data: report } = await supabase.from('monthly_reports').select('*')
-        .eq('user_id', worker.id)
-        .eq('month', monthStart)
-        .single()
-
-      const bonus = report?.bonus || 0
-      const consumption = report?.consumption || 0
-      const penalty = report?.penalty || 0
-
-      const status = ts.every(t => t.status === 'approved') ? 'approved' :
-        ts.some(t => t.status === 'submitted') ? 'submitted' : 'draft'
-
-      const payout = Math.round(wage + tips + bonus - consumption - penalty)
-
-      sums.push({
-        worker,
-        totalHours: Math.round(totalHours * 10) / 10,
-        nightHours: Math.round(nightHours * 10) / 10,
-        wage: Math.round(wage),
+      return {
+        worker: w,
+        totalHours: Math.round(totalHours * 100) / 100,
+        nightHours: Math.round(nightHours * 100) / 100,
+        wage,
         tips,
         bonus,
         consumption,
         penalty,
         payout,
         status,
-        timesheetIds: ts.map(t => t.id),
-      })
-
-      setAdjustments(prev => ({
-        ...prev,
-        [worker.id]: {
-          bonus: String(bonus),
-          consumption: String(consumption),
-          penalty: String(penalty),
-        }
-      }))
-    }
+        timesheetIds: workerRows.map((r: any) => r.id),
+      }
+    })
 
     setSummaries(sums)
-  }
 
-  const loadDetail = async (workerId: string) => {
-    setSelectedWorker(workerId)
+    // Init adjustments
+    const adj: Record<string, Adjustments> = {}
+    sums.forEach(s => {
+      adj[s.worker.id] = {
+        tips: String(s.tips || 0),
+        bonus: String(s.bonus || 0),
+        consumption: String(s.consumption || 0),
+        penalty: String(s.penalty || 0),
+      }
+    })
+    setAdjustments(adj)
 
-    const { data: ts } = await supabase.from('timesheets').select('*')
+    setLoading(false)
+  }, [monthDate])
+
+  useEffect(() => { loadData() }, [loadData])
+
+  // ─── Load detail rows ─────────────────────────────────────
+  const loadDetail = useCallback(async (workerId: string) => {
+    const mk = monthKey(monthDate)
+    const startDate = `${mk}-01`
+    const endDay = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0).getDate()
+    const endDate = `${mk}-${String(endDay).padStart(2, '0')}`
+
+    const { data } = await supabase
+      .from('timesheets')
+      .select('*')
       .eq('user_id', workerId)
-      .gte('work_date', monthStart).lte('work_date', monthEnd)
+      .gte('work_date', startDate)
+      .lte('work_date', endDate)
       .is('deleted_at', null)
       .order('work_date')
 
-    if (ts) {
-      setDetailRows(ts.map(t => ({
-        ...t,
-        actual_start: t.actual_start?.slice(0, 5) || '',
-        actual_end: t.actual_end?.slice(0, 5) || '',
-        admin_start: null,
-        admin_end: null,
-        admin_night: null,
-      })))
-    }
-  }
+    setDetailRows(data || [])
+    setSelectedWorker(workerId)
+    setShowAddRow(false)
+    setNewRow({ date: '', start: '', end: '', note: '' })
+  }, [monthDate])
 
-  const updateDetailRow = (id: string, field: string, value: any) => {
-    setDetailRows(prev => prev.map(r => r.id === id ? { ...r, [field]: value } : r))
-  }
-
-  const timeToMinutes = (t: string) => {
-    if (!t) return 0
-    const [h, m] = t.split(':').map(Number)
-    return h * 60 + m
-  }
-
-  const calcHours = (start: string, end: string) => {
-    if (!start || !end) return 0
-    const s = timeToMinutes(start)
-    let e = timeToMinutes(end)
-    if (end === '23:59') e = 24 * 60
-    if (e <= s) e += 24 * 60
-    return Math.round(((e - s) / 60) * 10) / 10
-  }
-
-  const getEffectiveHours = (row: TimesheetRow) => {
-    const start = row.admin_start || row.actual_start
-    const end = row.admin_end || row.actual_end
-    const night = row.admin_night !== null ? row.admin_night : row.night_hours
-    return calcHours(start, end) + night
-  }
-
-  const handleSaveAdjustments = async (workerId: string) => {
+  // ─── Reject / unreject row ────────────────────────────────
+  const toggleReject = async (rowId: string, currentlyRejected: boolean) => {
     setSaving(true)
+    if (currentlyRejected) {
+      await supabase.from('timesheets').update({
+        rejected_at: null,
+        rejected_by: null,
+      }).eq('id', rowId)
+    } else {
+      await supabase.from('timesheets').update({
+        rejected_at: new Date().toISOString(),
+        rejected_by: currentUser?.id || null,
+      }).eq('id', rowId)
+    }
+    await loadDetail(selectedWorker!)
+    await loadData()
+    setSaving(false)
+  }
+
+  // ─── Add admin row ────────────────────────────────────────
+  const addAdminRow = async () => {
+    if (!newRow.date || !newRow.start || !newRow.end || !selectedWorker) return
+    setSaving(true)
+    const hours = calcHours(newRow.start, newRow.end)
+    const night = calcNightHours(newRow.start, newRow.end)
+
+    await supabase.from('timesheets').insert({
+      user_id: selectedWorker,
+      work_date: newRow.date,
+      actual_start: newRow.start,
+      actual_end: newRow.end,
+      hours_worked: hours,
+      night_hours: night,
+      source: 'admin',
+      status: 'submitted',
+      added_by_admin: currentUser?.id || null,
+      admin_note: newRow.note || null,
+    })
+
+    setNewRow({ date: '', start: '', end: '', note: '' })
+    setShowAddRow(false)
+    await loadDetail(selectedWorker)
+    await loadData()
+    setSaving(false)
+    showMsg('Řádek přidán')
+  }
+
+  // ─── Save adjustments ─────────────────────────────────────
+  const saveAdjustments = async (workerId: string) => {
+    setSaving(true)
+    const mk = monthKey(monthDate)
     const adj = adjustments[workerId]
     if (!adj) return
 
-    const { data: existing } = await supabase.from('monthly_reports').select('id')
-      .eq('user_id', workerId).eq('month', monthStart).single()
+    const { data: existing } = await supabase
+      .from('monthly_reports')
+      .select('id')
+      .eq('user_id', workerId)
+      .eq('month', mk)
+      .maybeSingle()
 
-    const sum = summaries.find(s => s.worker.id === workerId)
-    const data = {
+    const payload = {
       user_id: workerId,
-      month: monthStart,
-      total_hours: sum?.totalHours || 0,
-      manual_hours: 0,
-      hourly_rate: sum?.worker.hourly_rate || 0,
-      wage_total: sum?.wage || 0,
-      tips_total: sum?.tips || 0,
-      bonus: parseFloat(adj.bonus) || 0,
-      consumption: parseFloat(adj.consumption) || 0,
-      penalty: parseFloat(adj.penalty) || 0,
-      payout_total: 0,
-      status: 'draft',
+      month: mk,
+      tips: Number(adj.tips) || 0,
+      bonus: Number(adj.bonus) || 0,
+      consumption: Number(adj.consumption) || 0,
+      penalty: Number(adj.penalty) || 0,
     }
-    data.payout_total = Math.round(data.wage_total + data.tips_total + data.bonus - data.consumption - data.penalty)
 
     if (existing) {
-      await supabase.from('monthly_reports').update(data).eq('id', existing.id)
+      await supabase.from('monthly_reports').update(payload).eq('id', existing.id)
     } else {
-      await supabase.from('monthly_reports').insert(data)
+      await supabase.from('monthly_reports').insert(payload)
     }
 
-    await loadSummaries()
+    await loadData()
     setSaving(false)
-    setMessage('Uloženo.')
+    showMsg('Uloženo')
   }
 
+  // ─── Approve ──────────────────────────────────────────────
   const handleApprove = async (workerId: string) => {
-    if (!confirm('Schválit timesheet tohoto brigádníka?')) return
     setSaving(true)
+    const mk = monthKey(monthDate)
 
-    const sum = summaries.find(s => s.worker.id === workerId)
-    if (!sum) return
+    // Save adjustments first
+    await saveAdjustments(workerId)
 
-    // Save admin edits to timesheets
-    for (const row of detailRows) {
-      const updates: any = {}
-      if (row.admin_start) updates.actual_start = row.admin_start
-      if (row.admin_end) updates.actual_end = row.admin_end
-      if (row.admin_night !== null) updates.night_hours = row.admin_night
-      updates.status = 'approved'
-      updates.hours_worked = getEffectiveHours(row)
-      await supabase.from('timesheets').update(updates).eq('id', row.id)
-    }
+    // Update or create monthly_report as approved
+    const { data: existing } = await supabase
+      .from('monthly_reports')
+      .select('id')
+      .eq('user_id', workerId)
+      .eq('month', mk)
+      .maybeSingle()
 
-    // Update monthly report
-    const adj = adjustments[workerId] || { bonus: '0', consumption: '0', penalty: '0' }
-    const { data: existing } = await supabase.from('monthly_reports').select('id')
-      .eq('user_id', workerId).eq('month', monthStart).single()
-
-    const reportData = {
-      user_id: workerId,
-      month: monthStart,
-      total_hours: sum.totalHours,
-      manual_hours: 0,
-      hourly_rate: sum.worker.hourly_rate,
-      wage_total: sum.wage,
-      tips_total: sum.tips,
-      bonus: parseFloat(adj.bonus) || 0,
-      consumption: parseFloat(adj.consumption) || 0,
-      penalty: parseFloat(adj.penalty) || 0,
-      payout_total: 0,
-      status: 'approved_by_admin',
-      approved_by: currentUser.id,
+    const approvalPayload = {
+      status: 'approved',
       approved_at: new Date().toISOString(),
+      approved_by: currentUser?.id || null,
     }
-    reportData.payout_total = Math.round(reportData.wage_total + reportData.tips_total + reportData.bonus - (reportData.consumption || 0) - (reportData.penalty || 0))
 
     if (existing) {
-      await supabase.from('monthly_reports').update(reportData).eq('id', existing.id)
+      await supabase.from('monthly_reports').update(approvalPayload).eq('id', existing.id)
     } else {
-      await supabase.from('monthly_reports').insert(reportData)
+      await supabase.from('monthly_reports').insert({
+        user_id: workerId,
+        month: mk,
+        tips: Number(adjustments[workerId]?.tips) || 0,
+        bonus: Number(adjustments[workerId]?.bonus) || 0,
+        consumption: Number(adjustments[workerId]?.consumption) || 0,
+        penalty: Number(adjustments[workerId]?.penalty) || 0,
+        ...approvalPayload,
+      })
     }
 
-    await loadSummaries()
+    // Update all timesheet rows status
+    const summary = summaries.find(s => s.worker.id === workerId)
+    if (summary) {
+      await supabase.from('timesheets')
+        .update({ status: 'approved' })
+        .in('id', summary.timesheetIds)
+    }
+
+    await loadData()
     if (selectedWorker === workerId) await loadDetail(workerId)
     setSaving(false)
-    setMessage('Timesheet schválen.')
+    showMsg('Timesheet schválen ✓')
   }
 
+  // ─── Reopen (edit approved) ───────────────────────────────
   const handleReopen = async (workerId: string) => {
-    if (!confirm('Znovu otevřít timesheet k editaci?')) return
     setSaving(true)
+    const mk = monthKey(monthDate)
 
-    const sum = summaries.find(s => s.worker.id === workerId)
-    if (!sum) return
+    await supabase.from('monthly_reports')
+      .update({ status: 'submitted', approved_at: null, approved_by: null })
+      .eq('user_id', workerId)
+      .eq('month', mk)
 
-    for (const tsId of sum.timesheetIds) {
-      await supabase.from('timesheets').update({ status: 'submitted' }).eq('id', tsId)
+    const summary = summaries.find(s => s.worker.id === workerId)
+    if (summary) {
+      await supabase.from('timesheets')
+        .update({ status: 'submitted' })
+        .in('id', summary.timesheetIds)
     }
 
-    await supabase.from('monthly_reports').update({ status: 'draft' })
-      .eq('user_id', workerId).eq('month', monthStart)
-
-    await loadSummaries()
+    await loadData()
     if (selectedWorker === workerId) await loadDetail(workerId)
     setSaving(false)
+    showMsg('Timesheet vrácen ke schválení')
   }
 
-  const changeMonth = (dir: number) => {
-    setSelectedWorker(null)
-    setMonthDate(prev => {
-      const d = new Date(prev.year, prev.month + dir, 1)
-      return { year: d.getFullYear(), month: d.getMonth() }
-    })
+  // ─── Send email ───────────────────────────────────────────
+  const handleSendEmail = (workerId: string) => {
+    const summary = summaries.find(s => s.worker.id === workerId)
+    if (!summary) return
+
+    const mk = monthKey(monthDate)
+    const w = summary.worker
+    const cappedPayout = Math.min(summary.payout, 11400)
+
+    const subject = encodeURIComponent(`Timesheet ${monthLabel(monthDate)} – ${w.name}`)
+    const body = encodeURIComponent(
+      `Timesheet: ${monthLabel(monthDate)}\n` +
+      `Brigádník: ${w.name}\n` +
+      `E-mail: ${w.email}\n` +
+      `Bankovní účet: ${w.bank_account || '—'}\n\n` +
+      `Odpracované hodiny: ${summary.totalHours} h\n` +
+      `  z toho noční: ${summary.nightHours} h\n` +
+      `Hodinová sazba: ${w.hourly_rate} Kč\n` +
+      `Mzda: ${formatCZK(summary.wage)}\n\n` +
+      `Dýška: ${formatCZK(summary.tips)}\n` +
+      `Mimořádná odměna: ${formatCZK(summary.bonus)}\n` +
+      `Spotřeba: -${formatCZK(summary.consumption)}\n` +
+      `Pokuta: -${formatCZK(summary.penalty)}\n\n` +
+      `CELKEM K VÝPLATĚ: ${formatCZK(summary.payout)}\n` +
+      `(QR platba max: ${formatCZK(cappedPayout)})\n\n` +
+      `---\nVygenerováno v systému Saluta`
+    )
+
+    window.open(`mailto:veronika.cesakova@gmail.com?subject=${subject}&body=${body}`, '_blank')
   }
 
-  const fmtDate = (d: string) => {
-    const dt = new Date(d)
-    const names = ['Ne', 'Po', 'Út', 'St', 'Čt', 'Pá', 'So']
-    return `${names[dt.getDay()]} ${dt.getDate()}.${dt.getMonth() + 1}.`
-  }
-
-  const generateQrData = (sum: MonthSummary) => {
-    const account = sum.worker.bank_account || ''
-    const parts = account.split('/')
-    if (parts.length !== 2) return null
-
-    const accountNum = parts[0]
-    const bankCode = parts[1]
-    const iban = `CZ00${bankCode}${'0'.repeat(16 - accountNum.length)}${accountNum}`
-    const amount = Math.min(sum.payout, 11400)
-    const msg = `Mzda ${monthLabel} ${sum.worker.name}`.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-
-    return `SPD*1.0*ACC:${iban}*AM:${amount}.00*CC:CZK*MSG:${msg}*`
-  }
-
+  // ─── Derived state ────────────────────────────────────────
   const selectedSummary = summaries.find(s => s.worker.id === selectedWorker)
+  const isApproved = selectedSummary?.status === 'approved'
 
-  if (loading) return <div className="min-h-screen flex items-center justify-center bg-gray-50"><p className="text-gray-500">Načítám...</p></div>
-
+  // ─── Render ───────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gray-50">
-      <nav className="bg-white border-b border-gray-200 px-4 py-3">
-        <div className="max-w-6xl mx-auto flex justify-between items-center">
+      {/* Header */}
+      <header className="bg-white border-b border-gray-200 px-6 py-4">
+        <div className="max-w-6xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <a href="/" className="text-lg font-bold text-gray-900">Saluti</a>
-            <span className="text-gray-300">/</span>
-            <span className="text-sm text-gray-600">Schvalování timesheetů</span>
+            <a href="/" className="text-gray-400 hover:text-gray-600 text-sm">← Dashboard</a>
+            <h1 className="text-lg font-semibold text-gray-900">Schvalování timesheetů</h1>
           </div>
-          <span className="text-sm text-gray-500">{currentUser?.email}</span>
-        </div>
-      </nav>
-
-      <main className="max-w-6xl mx-auto px-4 py-6">
-        {/* Month nav */}
-        <div className="flex items-center gap-3 mb-6">
-          <button onClick={() => changeMonth(-1)} className="px-3 py-1 bg-white border border-gray-300 rounded-lg text-sm hover:bg-gray-50">&larr;</button>
-          <span className="text-base font-semibold text-gray-900 capitalize">{monthLabel}</span>
-          <button onClick={() => changeMonth(1)} className="px-3 py-1 bg-white border border-gray-300 rounded-lg text-sm hover:bg-gray-50">&rarr;</button>
-        </div>
-
-        {message && (
-          <div className="mb-4 px-4 py-2 bg-green-50 border border-green-200 rounded-lg text-sm text-green-700">{message}</div>
-        )}
-
-        {/* Workers summary table */}
-        {summaries.length === 0 ? (
-          <div className="bg-white border border-gray-200 rounded-lg p-12 text-center">
-            <p className="text-gray-500">V tomto měsíci nejsou žádné timesheety.</p>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setMonthDate(new Date(monthDate.getFullYear(), monthDate.getMonth() - 1, 1))}
+              className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50"
+            >
+              ←
+            </button>
+            <span className="text-sm font-medium text-gray-700 min-w-[140px] text-center capitalize">
+              {monthLabel(monthDate)}
+            </span>
+            <button
+              onClick={() => setMonthDate(new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 1))}
+              className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg hover:bg-gray-50"
+            >
+              →
+            </button>
           </div>
+        </div>
+      </header>
+
+      {/* Toast */}
+      {message && (
+        <div className={`fixed top-4 right-4 z-50 px-4 py-2 rounded-lg text-sm shadow-lg ${
+          messageType === 'ok' ? 'bg-green-600 text-white' : 'bg-red-600 text-white'
+        }`}>
+          {message}
+        </div>
+      )}
+
+      <main className="max-w-6xl mx-auto p-6">
+        {loading ? (
+          <div className="text-center text-gray-400 py-20">Načítám…</div>
         ) : (
-          <div className="bg-white border border-gray-200 rounded-lg overflow-hidden mb-6">
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-gray-50 border-b border-gray-200">
-                    <th className="text-left px-4 py-3 font-medium text-gray-500">Brigádník</th>
-                    <th className="text-right px-4 py-3 font-medium text-gray-500">Hodiny</th>
-                    <th className="text-right px-4 py-3 font-medium text-gray-500">Noční</th>
-                    <th className="text-right px-4 py-3 font-medium text-gray-500">Sazba</th>
-                    <th className="text-right px-4 py-3 font-medium text-gray-500">Mzda</th>
-                    <th className="text-right px-4 py-3 font-medium text-gray-500">Dýška</th>
-                    <th className="text-right px-4 py-3 font-medium text-gray-500">K výplatě</th>
-                    <th className="text-center px-4 py-3 font-medium text-gray-500">Status</th>
-                    <th className="px-4 py-3"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {summaries.map(sum => {
-                    const isSelected = selectedWorker === sum.worker.id
-                    return (
-                      <tr key={sum.worker.id}
-                        className={`border-b border-gray-100 cursor-pointer hover:bg-gray-50 ${isSelected ? 'bg-orange-50' : ''}`}
-                        onClick={() => isSelected ? setSelectedWorker(null) : loadDetail(sum.worker.id)}
-                      >
-                        <td className="px-4 py-3">
-                          <div className="font-medium text-gray-900">{sum.worker.name}</div>
-                          <div className="text-xs text-gray-500">{sum.worker.email}</div>
-                        </td>
-                        <td className="px-4 py-3 text-right text-gray-900">{sum.totalHours} h</td>
-                        <td className="px-4 py-3 text-right text-orange-600">{sum.nightHours > 0 ? `${sum.nightHours} h` : '–'}</td>
-                        <td className="px-4 py-3 text-right text-gray-500">{sum.worker.hourly_rate} Kč</td>
-                        <td className="px-4 py-3 text-right text-gray-900">{sum.wage.toLocaleString('cs-CZ')} Kč</td>
-                        <td className="px-4 py-3 text-right text-gray-900">{sum.tips > 0 ? `${sum.tips.toLocaleString('cs-CZ')} Kč` : '–'}</td>
-                        <td className="px-4 py-3 text-right font-semibold text-gray-900">{sum.payout.toLocaleString('cs-CZ')} Kč</td>
-                        <td className="px-4 py-3 text-center">
-                          <span className={`text-xs px-2 py-1 rounded ${
-                            sum.status === 'approved' ? 'bg-green-100 text-green-700' :
-                            sum.status === 'submitted' ? 'bg-blue-100 text-blue-700' :
-                            'bg-gray-100 text-gray-600'
-                          }`}>
-                            {sum.status === 'approved' ? 'Schváleno' :
-                             sum.status === 'submitted' ? 'Ke schválení' : 'Rozpracováno'}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                          <span className="text-gray-400">{isSelected ? '▲' : '▼'}</span>
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {/* Detail panel */}
-        {selectedWorker && selectedSummary && (
-          <div className="bg-white border border-gray-200 rounded-lg p-6">
-            <h3 className="font-semibold text-gray-900 mb-4">
-              Detail — {selectedSummary.worker.name}, {monthLabel}
-            </h3>
-
-            {/* Detail timesheet rows */}
-            <div className="overflow-x-auto mb-6">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-gray-50 border-b border-gray-200">
-                    <th className="text-left px-3 py-2 font-medium text-gray-500">Den</th>
-                    <th className="text-left px-3 py-2 font-medium text-gray-500">Příchod</th>
-                    <th className="text-left px-3 py-2 font-medium text-gray-500">Odchod</th>
-                    <th className="text-left px-3 py-2 font-medium text-gray-500">Noční</th>
-                    <th className="text-left px-3 py-2 font-medium text-gray-500">Admin korekce</th>
-                    <th className="text-right px-3 py-2 font-medium text-gray-500">Hodiny</th>
-                    <th className="text-center px-3 py-2 font-medium text-gray-500">Zdroj</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {detailRows.map(row => {
-                    const hasAdminEdit = row.admin_start || row.admin_end || row.admin_night !== null
-                    const effectiveHours = getEffectiveHours(row)
-
-                    return (
-                      <tr key={row.id} className="border-b border-gray-100">
-                        <td className="px-3 py-2 font-medium text-gray-900">{fmtDate(row.work_date)}</td>
-                        <td className="px-3 py-2">
-                          <div className={`${row.admin_start ? 'line-through text-gray-400' : 'text-gray-900'}`}>
-                            {row.actual_start}
-                          </div>
-                          {selectedSummary.status !== 'approved' && (
-                            <input type="time" value={row.admin_start || ''}
-                              onChange={(e) => updateDetailRow(row.id, 'admin_start', e.target.value || null)}
-                              placeholder="Korekce"
-                              className="w-full mt-1 px-1 py-0.5 border border-orange-200 rounded text-xs text-orange-700" />
-                          )}
-                        </td>
-                        <td className="px-3 py-2">
-                          <div className={`${row.admin_end ? 'line-through text-gray-400' : 'text-gray-900'}`}>
-                            {row.actual_end}
-                          </div>
-                          {selectedSummary.status !== 'approved' && (
-                            <input type="time" value={row.admin_end || ''}
-                              onChange={(e) => updateDetailRow(row.id, 'admin_end', e.target.value || null)}
-                              placeholder="Korekce"
-                              className="w-full mt-1 px-1 py-0.5 border border-orange-200 rounded text-xs text-orange-700" />
-                          )}
-                        </td>
-                        <td className="px-3 py-2 text-orange-600">
-                          {row.night_hours > 0 ? `${row.night_hours} h` : '–'}
-                        </td>
-                        <td className="px-3 py-2">
-                          {hasAdminEdit && (
-                            <span className="text-xs text-orange-600">
-                              {row.admin_start && `Příchod: ${row.admin_start}`}
-                              {row.admin_end && ` Odchod: ${row.admin_end}`}
-                            </span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2 text-right font-medium text-gray-900">{effectiveHours.toFixed(1)} h</td>
-                        <td className="px-3 py-2 text-center">
-                          <span className={`text-xs px-2 py-1 rounded ${
-                            row.source === 'manual' ? 'bg-yellow-100 text-yellow-800' : 'bg-gray-100 text-gray-600'
-                          }`}>{row.source === 'manual' ? 'Ručně' : 'Směna'}</span>
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-
-            {/* Adjustments */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-              <div>
-                <label className="block text-sm text-gray-600 mb-1">Mimořádná odměna (Kč)</label>
-                <input type="number" value={adjustments[selectedWorker]?.bonus || '0'}
-                  onChange={(e) => setAdjustments(prev => ({ ...prev, [selectedWorker!]: { ...prev[selectedWorker!], bonus: e.target.value } }))}
-                  disabled={selectedSummary.status === 'approved'}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm disabled:bg-gray-100" />
-              </div>
-              <div>
-                <label className="block text-sm text-gray-600 mb-1">Spotřeba — odečíst (Kč)</label>
-                <input type="number" value={adjustments[selectedWorker]?.consumption || '0'}
-                  onChange={(e) => setAdjustments(prev => ({ ...prev, [selectedWorker!]: { ...prev[selectedWorker!], consumption: e.target.value } }))}
-                  disabled={selectedSummary.status === 'approved'}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm disabled:bg-gray-100" />
-              </div>
-              <div>
-                <label className="block text-sm text-gray-600 mb-1">Pokuta — odečíst (Kč)</label>
-                <input type="number" value={adjustments[selectedWorker]?.penalty || '0'}
-                  onChange={(e) => setAdjustments(prev => ({ ...prev, [selectedWorker!]: { ...prev[selectedWorker!], penalty: e.target.value } }))}
-                  disabled={selectedSummary.status === 'approved'}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm disabled:bg-gray-100" />
-              </div>
-            </div>
-
-            {/* Payout summary */}
-            <div className="border border-gray-200 rounded-lg overflow-hidden mb-6">
-              <table className="w-full text-sm">
-                <tbody>
-                  <tr><td className="px-4 py-2 text-gray-600">Mzda</td><td className="px-4 py-2 text-right">{selectedSummary.wage.toLocaleString('cs-CZ')} Kč</td></tr>
-                  <tr className="border-t border-gray-100"><td className="px-4 py-2 text-gray-600">Dýška</td><td className="px-4 py-2 text-right">{selectedSummary.tips.toLocaleString('cs-CZ')} Kč</td></tr>
-                  {parseFloat(adjustments[selectedWorker]?.bonus || '0') > 0 && (
-                    <tr className="border-t border-gray-100"><td className="px-4 py-2 text-green-600">+ Odměna</td><td className="px-4 py-2 text-right text-green-600">{parseFloat(adjustments[selectedWorker]?.bonus || '0').toLocaleString('cs-CZ')} Kč</td></tr>
-                  )}
-                  {parseFloat(adjustments[selectedWorker]?.consumption || '0') > 0 && (
-                    <tr className="border-t border-gray-100"><td className="px-4 py-2 text-red-600">− Spotřeba</td><td className="px-4 py-2 text-right text-red-600">{parseFloat(adjustments[selectedWorker]?.consumption || '0').toLocaleString('cs-CZ')} Kč</td></tr>
-                  )}
-                  {parseFloat(adjustments[selectedWorker]?.penalty || '0') > 0 && (
-                    <tr className="border-t border-gray-100"><td className="px-4 py-2 text-red-600">− Pokuta</td><td className="px-4 py-2 text-right text-red-600">{parseFloat(adjustments[selectedWorker]?.penalty || '0').toLocaleString('cs-CZ')} Kč</td></tr>
-                  )}
-                  <tr className="border-t-2 border-gray-300 bg-gray-50">
-                    <td className="px-4 py-3 font-semibold text-gray-900">K výplatě</td>
-                    <td className="px-4 py-3 text-right font-semibold text-lg text-gray-900">{selectedSummary.payout.toLocaleString('cs-CZ')} Kč</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            {/* QR code for approved */}
-            {selectedSummary.status === 'approved' && selectedSummary.worker.bank_account && (
-              <div className="border border-gray-200 rounded-lg p-4 mb-6">
-                <div className="flex gap-6 items-start">
-                  <div>
-                    <div className="text-sm font-medium text-gray-900 mb-2">Platba převodem</div>
-                    <div className="text-sm text-gray-600">
-                      Účet: <strong>{selectedSummary.worker.bank_account}</strong><br />
-                      Částka: <strong>{Math.min(selectedSummary.payout, 11400).toLocaleString('cs-CZ')} Kč</strong>
-                      {selectedSummary.payout > 11400 && <span className="text-xs text-orange-600 ml-1">(max 11 400 Kč v QR)</span>}<br />
-                      Zpráva: <strong>Mzda {monthLabel} {selectedSummary.worker.name}</strong>
-                    </div>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* ─── Left: Workers list ─────────────────────── */}
+            <div className="lg:col-span-1 space-y-2">
+              <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">
+                Brigádníci — {monthLabel(monthDate)}
+              </h2>
+              {summaries.length === 0 && (
+                <p className="text-sm text-gray-400">Žádní brigádníci</p>
+              )}
+              {summaries.map(s => (
+                <button
+                  key={s.worker.id}
+                  onClick={() => loadDetail(s.worker.id)}
+                  className={`w-full text-left p-4 rounded-xl border transition-all ${
+                    selectedWorker === s.worker.id
+                      ? 'border-orange-400 bg-orange-50 shadow-sm'
+                      : 'border-gray-200 bg-white hover:border-gray-300'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-medium text-gray-900">{s.worker.name}</span>
+                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                      s.status === 'approved'
+                        ? 'bg-green-100 text-green-700'
+                        : s.status === 'submitted'
+                        ? 'bg-yellow-100 text-yellow-700'
+                        : 'bg-gray-100 text-gray-500'
+                    }`}>
+                      {s.status === 'approved' ? 'Schváleno' : s.status === 'submitted' ? 'Ke schválení' : 'Rozpracovaný'}
+                    </span>
                   </div>
-                  <div className="text-center">
-                    <div className="text-xs text-gray-500 mb-2">QR platba</div>
-                    <div id={`qr-${selectedSummary.worker.id}`} className="w-32 h-32 border border-gray-200 rounded flex items-center justify-center">
-                      <QrCode data={generateQrData(selectedSummary)} />
+                  <div className="flex items-center gap-4 text-xs text-gray-500">
+                    <span>{s.totalHours} h</span>
+                    <span>{s.worker.hourly_rate} Kč/h</span>
+                    <span className="font-semibold text-gray-700">{formatCZK(s.payout)}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            {/* ─── Right: Detail ──────────────────────────── */}
+            <div className="lg:col-span-2">
+              {!selectedWorker ? (
+                <div className="text-center text-gray-400 py-20 bg-white rounded-xl border border-gray-200">
+                  Vyber brigádníka vlevo
+                </div>
+              ) : selectedSummary && (
+                <div className="space-y-4">
+                  {/* Detail header */}
+                  <div className="bg-white rounded-xl border border-gray-200 p-5">
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="text-lg font-semibold text-gray-900">
+                        {selectedSummary.worker.name}
+                      </h3>
+                      <div className="flex gap-2">
+                        {isApproved ? (
+                          <>
+                            <button
+                              onClick={() => handleReopen(selectedWorker)}
+                              disabled={saving}
+                              className="px-4 py-2 text-sm border border-orange-300 text-orange-600 rounded-lg hover:bg-orange-50 disabled:opacity-50"
+                            >
+                              Vrátit ke schválení
+                            </button>
+                            <button
+                              onClick={() => handleSendEmail(selectedWorker)}
+                              className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                            >
+                              Odeslat e-mailem
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              onClick={() => saveAdjustments(selectedWorker)}
+                              disabled={saving}
+                              className="px-4 py-2 text-sm border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+                            >
+                              Uložit změny
+                            </button>
+                            <button
+                              onClick={() => handleApprove(selectedWorker)}
+                              disabled={saving}
+                              className="px-4 py-2 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
+                            >
+                              Schválit
+                            </button>
+                          </>
+                        )}
+                      </div>
                     </div>
+
+                    {/* Summary grid */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+                      <div className="bg-gray-50 rounded-lg p-3">
+                        <div className="text-gray-400 text-xs">Hodiny</div>
+                        <div className="font-semibold text-gray-900">{selectedSummary.totalHours} h</div>
+                        {selectedSummary.nightHours > 0 && (
+                          <div className="text-xs text-gray-400">z toho nočních: {selectedSummary.nightHours} h</div>
+                        )}
+                      </div>
+                      <div className="bg-gray-50 rounded-lg p-3">
+                        <div className="text-gray-400 text-xs">Mzda</div>
+                        <div className="font-semibold text-gray-900">{formatCZK(selectedSummary.wage)}</div>
+                        <div className="text-xs text-gray-400">{selectedSummary.worker.hourly_rate} Kč/h</div>
+                      </div>
+                      <div className="bg-gray-50 rounded-lg p-3">
+                        <div className="text-gray-400 text-xs">Dýška</div>
+                        <div className="font-semibold text-gray-900">{formatCZK(selectedSummary.tips)}</div>
+                      </div>
+                      <div className="bg-orange-50 rounded-lg p-3 border border-orange-200">
+                        <div className="text-orange-500 text-xs">K výplatě</div>
+                        <div className="font-bold text-orange-700 text-lg">{formatCZK(selectedSummary.payout)}</div>
+                        {selectedSummary.payout > 11400 && (
+                          <div className="text-xs text-red-500">QR max: {formatCZK(11400)}</div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Adjustments */}
+                    {!isApproved && adjustments[selectedWorker] && (
+                      <div className="mt-4 pt-4 border-t border-gray-100">
+                        <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Úpravy</h4>
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                          <div>
+                            <label className="text-xs text-gray-500">Dýška (Kč)</label>
+                            <input
+                              type="number"
+                              value={adjustments[selectedWorker].tips}
+                              onChange={e => setAdjustments(prev => ({
+                                ...prev,
+                                [selectedWorker!]: { ...prev[selectedWorker!], tips: e.target.value }
+                              }))}
+                              className="w-full mt-1 px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-orange-400"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-xs text-gray-500">Odměna (Kč)</label>
+                            <input
+                              type="number"
+                              value={adjustments[selectedWorker].bonus}
+                              onChange={e => setAdjustments(prev => ({
+                                ...prev,
+                                [selectedWorker!]: { ...prev[selectedWorker!], bonus: e.target.value }
+                              }))}
+                              className="w-full mt-1 px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-orange-400"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-xs text-gray-500">Spotřeba (Kč)</label>
+                            <input
+                              type="number"
+                              value={adjustments[selectedWorker].consumption}
+                              onChange={e => setAdjustments(prev => ({
+                                ...prev,
+                                [selectedWorker!]: { ...prev[selectedWorker!], consumption: e.target.value }
+                              }))}
+                              className="w-full mt-1 px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-orange-400"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-xs text-gray-500">Pokuta (Kč)</label>
+                            <input
+                              type="number"
+                              value={adjustments[selectedWorker].penalty}
+                              onChange={e => setAdjustments(prev => ({
+                                ...prev,
+                                [selectedWorker!]: { ...prev[selectedWorker!], penalty: e.target.value }
+                              }))}
+                              className="w-full mt-1 px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-orange-400"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Approved adjustments (read-only) */}
+                    {isApproved && (
+                      <div className="mt-4 pt-4 border-t border-gray-100">
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+                          {selectedSummary.bonus > 0 && (
+                            <div><span className="text-gray-400">Odměna:</span> <span className="text-green-600">+{formatCZK(selectedSummary.bonus)}</span></div>
+                          )}
+                          {selectedSummary.consumption > 0 && (
+                            <div><span className="text-gray-400">Spotřeba:</span> <span className="text-red-500">-{formatCZK(selectedSummary.consumption)}</span></div>
+                          )}
+                          {selectedSummary.penalty > 0 && (
+                            <div><span className="text-gray-400">Pokuta:</span> <span className="text-red-500">-{formatCZK(selectedSummary.penalty)}</span></div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* QR code (only when approved) */}
+                  {isApproved && selectedSummary.worker.bank_account && (
+                    <div className="bg-white rounded-xl border border-green-200 p-5 text-center">
+                      <h4 className="text-sm font-semibold text-gray-700 mb-3">QR platba</h4>
+                      <QrCode
+                        data={generateSPD(
+                          selectedSummary.worker.bank_account,
+                          selectedSummary.payout,
+                          `Vyplata ${selectedSummary.worker.name} ${monthLabel(monthDate)}`
+                        )}
+                        size={180}
+                      />
+                      <p className="mt-3 text-sm text-gray-500">
+                        {selectedSummary.worker.bank_account} · {formatCZK(Math.min(selectedSummary.payout, 11400))}
+                      </p>
+                      {selectedSummary.payout > 11400 && (
+                        <p className="text-xs text-red-500 mt-1">
+                          Celkem k výplatě {formatCZK(selectedSummary.payout)} — v QR kódu max {formatCZK(11400)}, zbytek {formatCZK(selectedSummary.payout - 11400)} doplat zvlášť
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {isApproved && !selectedSummary.worker.bank_account && (
+                    <div className="bg-yellow-50 rounded-xl border border-yellow-200 p-4 text-center text-sm text-yellow-700">
+                      Brigádník nemá zadaný bankovní účet — QR kód nelze vygenerovat.
+                      <a href="/users" className="underline ml-1">Doplnit ve správě uživatelů</a>
+                    </div>
+                  )}
+
+                  {/* Timesheet rows table */}
+                  <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+                    <div className="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
+                      <h4 className="text-sm font-semibold text-gray-700">Vykázané směny</h4>
+                      {!isApproved && (
+                        <button
+                          onClick={() => setShowAddRow(!showAddRow)}
+                          className="text-xs px-3 py-1 bg-orange-100 text-orange-700 rounded-lg hover:bg-orange-200"
+                        >
+                          {showAddRow ? 'Zrušit' : '+ Přidat řádek'}
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Add row form */}
+                    {showAddRow && (
+                      <div className="px-5 py-3 bg-orange-50 border-b border-orange-100 flex flex-wrap items-end gap-3">
+                        <div>
+                          <label className="text-xs text-gray-500">Datum</label>
+                          <input
+                            type="date"
+                            value={newRow.date}
+                            onChange={e => setNewRow(p => ({ ...p, date: e.target.value }))}
+                            className="block mt-1 px-2 py-1.5 text-sm border border-gray-300 rounded-lg"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500">Od</label>
+                          <input
+                            type="time"
+                            value={newRow.start}
+                            onChange={e => setNewRow(p => ({ ...p, start: e.target.value }))}
+                            className="block mt-1 px-2 py-1.5 text-sm border border-gray-300 rounded-lg"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs text-gray-500">Do</label>
+                          <input
+                            type="time"
+                            value={newRow.end}
+                            onChange={e => setNewRow(p => ({ ...p, end: e.target.value }))}
+                            className="block mt-1 px-2 py-1.5 text-sm border border-gray-300 rounded-lg"
+                          />
+                        </div>
+                        <div className="flex-1 min-w-[120px]">
+                          <label className="text-xs text-gray-500">Poznámka</label>
+                          <input
+                            type="text"
+                            placeholder="Volitelné…"
+                            value={newRow.note}
+                            onChange={e => setNewRow(p => ({ ...p, note: e.target.value }))}
+                            className="block mt-1 w-full px-2 py-1.5 text-sm border border-gray-300 rounded-lg"
+                          />
+                        </div>
+                        <button
+                          onClick={addAdminRow}
+                          disabled={saving || !newRow.date || !newRow.start || !newRow.end}
+                          className="px-4 py-1.5 text-sm bg-orange-500 text-white rounded-lg hover:bg-orange-600 disabled:opacity-50"
+                        >
+                          Přidat
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-left text-xs text-gray-400 uppercase tracking-wider border-b border-gray-100">
+                            <th className="px-5 py-2">Datum</th>
+                            <th className="px-3 py-2">Od</th>
+                            <th className="px-3 py-2">Do</th>
+                            <th className="px-3 py-2">Hodiny</th>
+                            <th className="px-3 py-2">Noční</th>
+                            <th className="px-3 py-2">Zdroj</th>
+                            <th className="px-3 py-2 text-right">Akce</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {detailRows.map(row => {
+                            const isRejected = !!row.rejected_at
+                            const isAdmin = row.source === 'admin' || !!row.added_by_admin
+                            return (
+                              <tr
+                                key={row.id}
+                                className={`border-b border-gray-50 ${
+                                  isRejected ? 'bg-red-50/50' : isAdmin ? 'bg-blue-50/30' : ''
+                                }`}
+                              >
+                                <td className={`px-5 py-2.5 ${isRejected ? 'line-through text-gray-400' : 'text-gray-900'}`}>
+                                  {formatDate(row.work_date)}
+                                </td>
+                                <td className={`px-3 py-2.5 ${isRejected ? 'line-through text-gray-400' : ''}`}>
+                                  {row.admin_start || row.actual_start}
+                                  {row.admin_start && row.admin_start !== row.actual_start && (
+                                    <span className="block text-xs text-gray-300 line-through">{row.actual_start}</span>
+                                  )}
+                                </td>
+                                <td className={`px-3 py-2.5 ${isRejected ? 'line-through text-gray-400' : ''}`}>
+                                  {row.admin_end || row.actual_end}
+                                  {row.admin_end && row.admin_end !== row.actual_end && (
+                                    <span className="block text-xs text-gray-300 line-through">{row.actual_end}</span>
+                                  )}
+                                </td>
+                                <td className={`px-3 py-2.5 ${isRejected ? 'line-through text-gray-400' : 'font-medium'}`}>
+                                  {row.admin_start
+                                    ? calcHours(row.admin_start, row.admin_end || row.actual_end).toFixed(1)
+                                    : row.hours_worked.toFixed(1)
+                                  }
+                                </td>
+                                <td className={`px-3 py-2.5 ${isRejected ? 'line-through text-gray-400' : ''}`}>
+                                  {row.admin_night !== null ? row.admin_night.toFixed(1) : (row.night_hours || 0).toFixed(1)}
+                                </td>
+                                <td className="px-3 py-2.5">
+                                  {isAdmin ? (
+                                    <span className="text-xs px-1.5 py-0.5 bg-blue-100 text-blue-600 rounded">admin</span>
+                                  ) : (
+                                    <span className="text-xs text-gray-400">{row.source || 'brigádník'}</span>
+                                  )}
+                                  {row.admin_note && (
+                                    <span className="block text-xs text-gray-400 italic mt-0.5">{row.admin_note}</span>
+                                  )}
+                                </td>
+                                <td className="px-3 py-2.5 text-right">
+                                  {!isApproved && (
+                                    <button
+                                      onClick={() => toggleReject(row.id, isRejected)}
+                                      disabled={saving}
+                                      className={`text-xs px-2 py-1 rounded ${
+                                        isRejected
+                                          ? 'bg-green-100 text-green-600 hover:bg-green-200'
+                                          : 'bg-red-100 text-red-600 hover:bg-red-200'
+                                      } disabled:opacity-50`}
+                                    >
+                                      {isRejected ? 'Obnovit' : 'Neschválit'}
+                                    </button>
+                                  )}
+                                  {isApproved && isRejected && (
+                                    <span className="text-xs text-red-400">Neschváleno</span>
+                                  )}
+                                </td>
+                              </tr>
+                            )
+                          })}
+                          {detailRows.length === 0 && (
+                            <tr>
+                              <td colSpan={7} className="px-5 py-8 text-center text-gray-400">
+                                Žádné vykázané směny
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Bottom add row button */}
+                    {!isApproved && !showAddRow && (
+                      <div className="px-5 py-3 border-t border-gray-100">
+                        <button
+                          onClick={() => setShowAddRow(true)}
+                          className="text-xs text-orange-500 hover:text-orange-700"
+                        >
+                          + Přidat řádek ručně
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
-              </div>
-            )}
-
-            {/* Actions */}
-            <div className="flex gap-3">
-              {selectedSummary.status !== 'approved' && (
-                <>
-                  <button onClick={() => handleSaveAdjustments(selectedWorker!)} disabled={saving}
-                    className="px-5 py-2 bg-white border border-gray-300 text-sm rounded-lg hover:bg-gray-50 disabled:opacity-50">
-                    Uložit změny
-                  </button>
-                  <button onClick={() => handleApprove(selectedWorker!)} disabled={saving}
-                    className="px-5 py-2 bg-green-600 text-white text-sm rounded-lg hover:bg-green-700 disabled:opacity-50">
-                    Schválit timesheet
-                  </button>
-                </>
-              )}
-              {selectedSummary.status === 'approved' && (
-                <button onClick={() => handleReopen(selectedWorker!)} disabled={saving}
-                  className="px-5 py-2 bg-white border border-orange-300 text-orange-600 text-sm rounded-lg hover:bg-orange-50 disabled:opacity-50">
-                  Znovu otevřít k editaci
-                </button>
               )}
             </div>
           </div>
@@ -608,35 +949,4 @@ export default function ApprovePage() {
       </main>
     </div>
   )
-}
-
-function QrCode({ data }: { data: string | null }) {
-  const [loaded, setLoaded] = useState(false)
-  const ref = useState<HTMLDivElement | null>(null)
-
-  useEffect(() => {
-    if (!data) return
-    const script = document.createElement('script')
-    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js'
-    script.onload = () => setLoaded(true)
-    document.head.appendChild(script)
-  }, [data])
-
-  useEffect(() => {
-    if (!loaded || !data) return
-    const el = document.getElementById('qr-render')
-    if (el) {
-      el.innerHTML = ''
-      new (window as any).QRCode(el, {
-        text: data,
-        width: 120,
-        height: 120,
-        correctLevel: (window as any).QRCode.CorrectLevel.M,
-      })
-    }
-  }, [loaded, data])
-
-  if (!data) return <span className="text-xs text-gray-400">Chybí účet</span>
-
-  return <div id="qr-render"></div>
 }

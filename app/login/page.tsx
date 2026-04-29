@@ -1,13 +1,20 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { supabase } from '../../lib/supabase'
+
 
 export default function LoginPage() {
   const [email, setEmail] = useState('')
   const [sent, setSent] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.location.search.includes('error=unauthorized')) {
+      setError('Nemáte oprávnění k přístupu. Kontaktujte administrátora.')
+    }
+  }, [])
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -56,7 +63,7 @@ export default function LoginPage() {
     <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
       <div className="max-w-sm w-full">
         <div className="text-center mb-8">
-          <h1 className="text-2xl font-bold text-gray-900">Saluty</h1>
+          <h1 className="text-2xl font-bold text-gray-900">Saluti</h1>
           <p className="text-gray-500 text-sm mt-1">Přihlaste se e-mailem</p>
         </div>
 

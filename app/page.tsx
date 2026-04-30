@@ -96,7 +96,7 @@ useEffect(() => {
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           <a href="/shifts" className="block bg-white rounded-lg border border-gray-200 p-6 hover:border-orange-300 transition-colors">
-            <div className="text-2xl mb-2">📅</div>
+            <div className="text-2xl mb-2">🗓️</div>
             <h3 className="font-semibold text-gray-900">Plánování směn</h3>
             <p className="text-sm text-gray-500 mt-1">Vytváření směn a přiřazování lidí</p>
           </a>
